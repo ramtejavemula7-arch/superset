@@ -1,29 +1,93 @@
-name: Deploy to GCP
+name: Build & Deploy Superset to Cloud Run
 
 on:
   push:
-    branches: [main]
+    branches:
+      - master         # Triggers on push to master
+
+env:
+  PROJECT_ID: project-b1008fb7-e9d3-4eb5-81f
+  REGION: us-central1
+  REPO_NAME: superset-repo
+  SERVICE_NAME: superset
+  IMAGE_NAME: us-central1-docker.pkg.dev/project-b1008fb7-e9d3-4eb5-81f/superset-repo/superset
 
 permissions:
   contents: read
-  id-token: write   # ← REQUIRED for WIF
+  id-token: write      # Required for WIF
 
 jobs:
-  deploy:
+  build-and-deploy:
+    name: Build, Push & Deploy
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      # ── 1. Checkout Code ─────────────────────────────────────
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # ── 2. Authenticate to GCP via WIF ───────────────────────
       - name: Authenticate to GCP
+        id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: "projects/717066773680/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
           service_account: "github-actions-sa@project-b1008fb7-e9d3-4eb5-81f.iam.gserviceaccount.com"
 
+      # ── 3. Set up Cloud SDK ───────────────────────────────────
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Verify Authentication
-        run: gcloud auth list
+      # ── 4. Configure Docker for Artifact Registry ─────────────
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      # ── 5. Set Image Tag ──────────────────────────────────────
+      - name: Set Image Tag
+        id: tag
+        run: |
+          SHORT_SHA="${GITHUB_SHA::8}"
+          echo "image_tag=${{ env.IMAGE_NAME }}:${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image_latest=${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
+          echo "Building image: ${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+
+      # ── 6. Build Docker Image ─────────────────────────────────
+      - name: Build Docker Image
+        run: |
+          docker build \
+            --tag "${{ steps.tag.outputs.image_tag }}" \
+            --tag "${{ steps.tag.outputs.image_latest }}" \
+            --file Dockerfile \
+            --cache-from "${{ steps.tag.outputs.image_latest }}" \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            .
+
+      # ── 7. Push to Artifact Registry ──────────────────────────
+      - name: Push Docker Image to Artifact Registry
+        run: |
+          docker push "${{ steps.tag.outputs.image_tag }}"
+          docker push "${{ steps.tag.outputs.image_latest }}"
+
+      # ── 8. Deploy to Cloud Run ────────────────────────────────
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          region: ${{ env.REGION }}
+          image: ${{ steps.tag.outputs.image_tag }}
+          flags: |
+            --port=8088
+            --min-instances=0
+            --max-instances=5
+            --memory=2Gi
+            --cpu=2
+            --allow-unauthenticated
+            --set-env-vars=SUPERSET_SECRET_KEY=${{ secrets.SUPERSET_SECRET_KEY }}
+
+      # ── 9. Print Deployment URL ───────────────────────────────
+      - name: Show Deployment URL
+        run: |
+          echo "✅ Superset deployed successfully!"
+          echo "🌐 URL: ${{ steps.deploy.outputs.url }}"
